@@ -6,7 +6,8 @@ import Darwin
 private actor Scenario {
     let codec: TLCodec
     let me = TLObject("user", ["id": .long(42), "self": .bool(true), "first_name": .string("Test"), "access_hash": .long(7)])
-    let friend = TLObject("user", ["id": .long(77), "first_name": .string("Friend"), "access_hash": .long(8)])
+    let friend: TLObject
+    let historyText: String
     var migrated = false
     var sends: [(String, Int64)] = []
     var failFirstSend = false
@@ -20,9 +21,12 @@ private actor Scenario {
     var channelDifferenceRequests = 0
     var listeners: [@Sendable (TLObject) async throws -> Void] = []
     var recoveringGap = false
-    init(failFirstSend: Bool = false, includeChannels: Bool = false, failFirstMediaSend: Bool = false) throws {
+    init(failFirstSend: Bool = false, includeChannels: Bool = false, failFirstMediaSend: Bool = false,
+         friendName: String = "Friend", historyText: String = "Hello history") throws {
         codec = try TLCodec(); self.failFirstSend = failFirstSend
         self.includeChannels = includeChannels; self.failFirstMediaSend = failFirstMediaSend
+        friend = TLObject("user", ["id": .long(77), "first_name": .string(friendName), "access_hash": .long(8)])
+        self.historyText = historyText
     }
     private func channel(_ id: Int64 = 77) throws -> TLObject {
         try minimum("channel", ["id": .long(id), "access_hash": .long(900 + id), "broadcast": .bool(true),
@@ -141,7 +145,7 @@ private actor Scenario {
             }
             let id: Int64 = peer?.name == "inputPeerSelf" ? 42 : 77
             let message = try minimum("message", ["id": .int(5), "date": .int(100),
-                "peer_id": .object(TLObject("peerUser", ["user_id": .long(id)])), "message": .string("Hello history")])
+                "peer_id": .object(TLObject("peerUser", ["user_id": .long(id)])), "message": .string(historyText)])
             return .object(try minimum("messages.messages", ["messages": .vector([.object(message)]),
                 "chats": .vector([]), "users": .vector([.object(me), .object(friend)])]))
         case "messages.readHistory": return .object(TLObject("messages.affectedMessages", ["pts": .int(10), "pts_count": .int(0)]))
@@ -376,6 +380,65 @@ private func fixtureClient(scenario: Scenario, signedIn: Bool) throws -> Telegra
             #expect(await scenario.uploaded.values.allSatisfy { $0[0] == uploadGIF })
             #expect(await scenario.readChannels.contains(77))
         }
+        send("\u{04}")
+        #expect(try await running.value == 0)
+    } catch {
+        send("\u{04}")
+        _ = try? await running.value
+        throw error
+    }
+}
+
+@Test(arguments: [1, 2, 3]) @MainActor func terminalRedrawPreservesScrolledHistoryWithEmoji(emojiWidth: Int) async throws {
+    let history = (1...100).map { String(format: "Line %03d ", $0) + String(repeating: "x", count: 78) }.joined(separator: "\n")
+    let scenario = try Scenario(friendName: "Friend ✌🏻", historyText: history)
+    let client = try fixtureClient(scenario: scenario, signedIn: true)
+    var master: Int32 = -1, slave: Int32 = -1
+    var size = winsize(ws_row: 51, ws_col: 117, ws_xpixel: 0, ws_ypixel: 0)
+    guard openpty(&master, &slave, nil, nil, &size) == 0 else { throw TelegraphError.invalid("openpty failed") }
+    defer { Darwin.close(master); Darwin.close(slave) }
+    _ = fcntl(master, F_SETFL, O_NONBLOCK)
+    let terminal = try TerminalIO(input: slave, output: slave, monitorSignals: false)
+    let ui = TerminalUI(terminal: terminal, client: client, downloadRoot: FileManager.default.temporaryDirectory)
+    let running = Task { try await ui.run() }
+    var screen = TestTerminalScreen(width: 117, height: 51, emojiWidth: emojiWidth)
+    func send(_ text: String) { let bytes = Array(text.utf8); _ = Darwin.write(master, bytes, bytes.count) }
+    func waitForFrame(_ text: String, composer: Bool = true) async throws {
+        var output = Data()
+        for _ in 0..<300 {
+            var bytes = [UInt8](repeating: 0, count: 16384)
+            let count = Darwin.read(master, &bytes, bytes.count)
+            if count > 0 { output.append(contentsOf: bytes.prefix(count)) }
+            let frame = String(decoding: output, as: UTF8.self)
+            let complete = composer ? frame.hasSuffix("\u{1b}[?25h") :
+                frame.hasSuffix("\u{1b}[0m") || frame.hasSuffix("\u{1b}[?7h")
+            if frame.contains(text), complete {
+                screen.feed(frame); return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw TelegraphError.invalid("Terminal did not display \(text)")
+    }
+    do {
+        try await waitForFrame("Connected", composer: false)
+        send("\u{1b}[B\r")
+        try await waitForFrame("Line 100")
+        send("\u{1b}[5~")
+        try await waitForFrame("Line 011")
+        let visible = (1...46).map { screen.line($0, from: 27) }
+        let expected = history.split(separator: "\n")[10..<56].map { "  " + $0 + " " }
+        #expect(visible == expected)
+        #expect(screen.line(0).hasPrefix(" TELEGRAPH"))
+        #expect((0...48).allSatisfy { screen.cell(row: $0, column: 26) == "│" })
+        #expect(screen.scrolls == 0)
+
+        // A later network event redraws the same viewport while the user is scrolled up.
+        try await scenario.emitIncoming(gap: false)
+        try await waitForFrame("Line 056")
+        #expect((1...46).map { screen.line($0, from: 27) } == visible)
+        #expect(screen.line(0).hasPrefix(" TELEGRAPH"))
+        #expect(screen.scrolls == 0)
+        #expect(screen.autowrap)
         send("\u{04}")
         #expect(try await running.value == 0)
     } catch {

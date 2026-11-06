@@ -448,10 +448,18 @@ final class TerminalUI {
                 focus == .history && lines[start + row - 1].mediaKey != nil && lines[start + row - 1].mediaKey == mediaSelection
             let leftStyle = leftHighlighted ? "\u{1b}[7m" : "\u{1b}[0m"
             let rightStyle = row == 0 || mediaHighlighted ? "\u{1b}[7m" : "\u{1b}[0m"
-            rows.append(leftStyle + TerminalText.fit(left[row], width: leftWidth) + "\u{1b}[0m│" +
+            rows.append(leftStyle + TerminalText.fit(left[row], width: leftWidth) +
+                        "\u{1b}[\(row + 1);\(leftWidth + 1)H\u{1b}[0m│" +
                         rightStyle + TerminalText.fit(right[row], width: rightWidth) + "\u{1b}[0m")
         }
-        var frame = "\u{1b}[?25l\u{1b}[H" + rows.joined(separator: "\r\n")
+        // Emoji can occupy more cells than our width estimate in some terminals.
+        // Disable wrapping and position each row and pane explicitly so a redraw
+        // cannot scroll the screen or leave a duplicated history line behind.
+        var frame = "\u{1b}[?25l\u{1b}[?7l\u{1b}[0m"
+        for (row, text) in rows.enumerated() {
+            frame += "\u{1b}[\(row + 1);1H\u{1b}[2K" + text
+        }
+        frame += "\u{1b}[?7h"
         if focus == .composer, snapshot.selectedID != nil, conversation?.canSend == true {
             let x = leftWidth + 4 + TerminalText.width(visibleBefore)
             frame += "\u{1b}[\(height - 2);\(min(width, x))H\u{1b}[?25h"
