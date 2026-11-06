@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import AppKit
 
 actor MediaStore {
     typealias Fetch = @Sendable (Media, Int64, Int32) async throws -> Data
@@ -59,7 +60,7 @@ actor MediaStore {
             }
             try handle.synchronize()
             try handle.close()
-            // No incomplete file is ever passed to Quick Look.
+            // No incomplete file is ever passed to a viewer.
             guard Darwin.rename(temporary.path, final.path) == 0 else {
                 throw TelegraphError.invalid("Could not finalize download: \(String(cString: strerror(errno)))")
             }
@@ -81,8 +82,22 @@ actor MediaStore {
 @MainActor
 final class MediaOpener {
     private var processes: [Process] = []
-    func open(_ url: URL) throws {
-        guard url.isFileURL else { throw TelegraphError.invalid("Quick Look requires a local file") }
+    private let openApplication: (URL) -> Bool
+
+    init(openApplication: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
+        self.openApplication = openApplication
+    }
+
+    func open(_ url: URL, kind: MediaKind) throws {
+        guard url.isFileURL else { throw TelegraphError.invalid("Media viewing requires a local file") }
+        // Quick Look's Movie plug-in can abort while loading AVPlayerItem on macOS 27.
+        // Telegram animations are often MP4s, so route GIFs as well as videos to Launch Services.
+        if kind == .video || kind == .gif {
+            guard openApplication(url) else {
+                throw TelegraphError.invalid("Could not open \(url.lastPathComponent) with its default app; the file is saved at \(url.path)")
+            }
+            return
+        }
         processes.removeAll { !$0.isRunning }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")

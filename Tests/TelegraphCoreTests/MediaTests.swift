@@ -101,3 +101,34 @@ private actor FileServer {
     #expect(image.kind == .image && image.size == 100 && image.location["thumb_size"].string == "y")
     #expect(image.restricted)
 }
+
+@Test @MainActor func moviesAndGIFsOpenWithDefaultApplication() throws {
+    var opened: [URL] = []
+    let opener = MediaOpener(openApplication: { opened.append($0); return true })
+    // Test the Telegram MP4 animation as well as native GIFs and ordinary videos.
+    let attachments: [(MediaKind, String)] = [(.gif, "gif-123.mp4"), (.gif, "gif-456.gif"),
+                                             (.video, "video-123.mp4"), (.video, "video-456.webm")]
+    let urls = attachments.map { FileManager.default.temporaryDirectory.appendingPathComponent($0.1) }
+    for ((kind, _), url) in zip(attachments, urls) { try opener.open(url, kind: kind) }
+    #expect(opened == urls)
+    opener.close()
+    #expect(opened == urls)
+}
+
+@Test @MainActor func mediaOpenFailureIsReportedAndRemoteURLsAreRejected() throws {
+    var calls = 0
+    let opener = MediaOpener(openApplication: { _ in calls += 1; return false })
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("gif-123.mp4")
+    do {
+        try opener.open(url, kind: .gif)
+        Issue.record("A failed open was reported as successful")
+    } catch {
+        #expect(describe(error).contains("default app"))
+        #expect(describe(error).contains(url.path))
+    }
+    #expect(calls == 1)
+    let remote = try #require(URL(string: "https://example.com/video.mp4"))
+    #expect(throws: (any Error).self) { try opener.open(remote, kind: .video) }
+    #expect(calls == 1)
+    opener.close()
+}

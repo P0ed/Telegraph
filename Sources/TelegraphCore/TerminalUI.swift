@@ -365,7 +365,7 @@ final class TerminalUI {
                     await self?.progress(media: media, downloaded: downloaded, total: total)
                 })
                 guard !self.stopped else { return }
-                try self.opener.open(url)
+                try self.opener.open(url, kind: media.kind)
                 self.status = "Opened \(media.label) — \(url.lastPathComponent)"
             } catch { self.status = describe(error) }
         }

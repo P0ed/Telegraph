@@ -3,8 +3,8 @@
 A minimal, full-screen Telegram client written in Swift for macOS 27.
 It supports a personal account's direct conversations, Saved Messages, and broadcast
 channels, phone-code login with 2FA, live messaging, file uploads, and paginated history.
-Click `[Image]`, `[Video]`,
-or `[GIF]` to download the attachment and open it with macOS Quick Look.
+Click `[Image]`, `[Video]`, or `[GIF]` to download and open the attachment. Still
+images use macOS Quick Look; videos and GIFs open in your default macOS app.
 
 The executable uses only Swift and macOS system libraries. There are no Swift package
 dependencies, background services, package-manager installs, or runtime resource bundles.
@@ -76,6 +76,8 @@ Downloads are saved to `~/Downloads/Telegraph/<account-id>/`. Downloads run one 
 time, stream to temporary files, and become reusable files only after completion.
 Repeated clicks during a download share the same transfer. GIF labels include
 Telegram animations stored as MP4; the file keeps its actual extension.
+Videos and GIFs bypass Quick Look's movie preview plug-in to avoid its macOS 27
+crash. Their viewer stays open when Telegraph exits.
 Protected and disappearing media cannot be saved. Unsupported attachments display
 a text label.
 

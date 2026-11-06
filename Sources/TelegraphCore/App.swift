@@ -29,7 +29,8 @@ public enum TelegraphApp {
             a chat/media or sends text. PgUp/PgDn scroll; Ctrl-J inserts a newline.
             Ctrl-F attaches a file: paste or drag its path, then Enter to attach.
             Type an optional caption; Enter sends. Ctrl-X removes the attachment.
-            Click [Image], [Video], or [GIF] to download and open with Quick Look.
+            Click [Image], [Video], or [GIF] to download and open.
+            Images use Quick Look; videos and GIFs use your default macOS app.
             Ctrl-C or Ctrl-D exits. Escape returns to the chat list.
 
             Downloads: ~/Downloads/Telegraph/<account-id>/
