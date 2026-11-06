@@ -21,6 +21,9 @@ actor TelegramClient {
     private var loading = false
     private var selectionGeneration = UUID()
     private var readMax: [Int64: Int32] = [:]
+    private var channelPTS: [Int64: Int32] = [:]
+    private var syncingChannels: Set<Int64> = []
+    private var bufferedChannels: [Int64: [TLObject]] = [:]
     private var pts: Int32 = 0, qts: Int32 = 0, date: Int32 = 0, seq: Int32 = 0
     private var messaging = false
     private var wantsMessaging = false
@@ -213,10 +216,24 @@ actor TelegramClient {
             if user["min"].bool, let old = users[id], old.fields["access_hash"] != nil { continue }
             users[id] = user
         }
-        for chat in object["chats"].objects { chats[chat["id"].long] = chat }
+        for chat in object["chats"].objects {
+            guard chat.name == "channel" || chat.name == "channelForbidden" else { continue }
+            let id = chat["id"].long
+            if chat["min"].bool, chats[id] != nil { continue }
+            chats[id] = chat
+            if dialogs[-id] != nil {
+                dialogs[-id]?.title = chat["title"].string
+                dialogs[-id]?.canSend = canPost(chat)
+            }
+        }
+    }
+    private func canPost(_ channel: TLObject) -> Bool {
+        channel.name == "channel" && channel["broadcast"].bool && !channel["left"].bool &&
+            (channel["creator"].bool || channel["admin_rights"].object?["post_messages"].bool == true)
     }
     private func title(_ id: Int64) -> String {
         if id == profile.userID { return "Saved Messages" }
+        if id < 0 { return chats[-id]?["title"].string ?? "Channel \(-id)" }
         guard let user = users[id] else { return "User \(id)" }
         let full = [user["first_name"].string, user["last_name"].string].filter { !$0.isEmpty }.joined(separator: " ")
         if !full.isEmpty { return full }
@@ -225,7 +242,13 @@ actor TelegramClient {
     }
     private func inputPeer(_ id: Int64) -> TLObject {
         if id == profile.userID { return TLObject("inputPeerSelf") }
+        if id < 0 {
+            return TLObject("inputPeerChannel", ["channel_id": .long(-id), "access_hash": .long(chats[-id]?["access_hash"].long ?? 0)])
+        }
         return TLObject("inputPeerUser", ["user_id": .long(id), "access_hash": .long(users[id]?["access_hash"].long ?? 0)])
+    }
+    private func inputChannel(_ id: Int64) -> TLObject {
+        TLObject("inputChannel", ["channel_id": .long(id), "access_hash": .long(chats[id]?["access_hash"].long ?? 0)])
     }
     private func inputPeer(_ peer: TLObject) -> TLObject? {
         switch peer.name {
@@ -253,14 +276,18 @@ actor TelegramClient {
                 let objects = reply["dialogs"].objects
                 let topMessages = reply["messages"].objects
                 for dialog in objects {
-                    guard dialog.name == "dialog", let peer = dialog["peer"].object, peer.name == "peerUser" else { continue }
-                    let id = peer["user_id"].long
+                    guard dialog.name == "dialog", let peer = dialog["peer"].object, let id = MessagePeer.id(peer) else { continue }
+                    if id < 0 {
+                        guard let channel = chats[-id], channel.name == "channel", channel["broadcast"].bool,
+                              !channel["left"].bool, channel.fields["access_hash"] != nil else { continue }
+                        channelPTS[-id] = max(channelPTS[-id] ?? 0, dialog["pts"].int)
+                    }
                     let top = topMessages.first { $0["id"].int == dialog["top_message"].int && $0["peer_id"].object == peer }
                     let message = top.flatMap(ChatMessage.from)
                     dialogs[id] = Conversation(id: id, title: title(id), unread: dialog["unread_count"].int,
                         date: top?["date"].int ?? 0,
                         preview: message.map { $0.text.isEmpty ? ($0.media?.label ?? $0.unsupported ?? "") : $0.text } ?? "",
-                        pinned: dialog["pinned"].bool)
+                        pinned: dialog["pinned"].bool, canSend: id > 0 || chats[-id].map(canPost) == true)
                 }
                 emit()
                 guard reply.name != "messages.dialogs", !objects.isEmpty,
@@ -283,6 +310,7 @@ actor TelegramClient {
             let reply = try await history(peer: id, offset: 0)
             guard selectedID == id, generation == selectionGeneration else { return }
             cache(reply)
+            if id < 0 { channelPTS[-id] = max(channelPTS[-id] ?? 0, reply["pts"].int) }
             let loaded = reply["messages"].objects.compactMap(ChatMessage.from).filter { $0.peerID == id }
             merge(loaded); hasOlder = reply["messages"].objects.count >= 50
             loading = false; emit()
@@ -320,15 +348,45 @@ actor TelegramClient {
     }
     func sendText(_ text: String, to peer: Int64, randomID: Int64) async throws {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        try requireWritable(peer)
         guard text.utf16.count <= 4096 else { throw TelegraphError.invalid("Messages are limited to 4,096 UTF-16 units") }
         let result = try await rpc("messages.sendMessage", [
             "peer": .object(inputPeer(peer)), "message": .string(text), "random_id": .long(randomID),
             "no_webpage": .bool(true)
         ])
+        await sent(result, text: text, peer: peer)
+    }
+    private func requireWritable(_ peer: Int64) throws {
+        guard dialogs[peer]?.canSend == true else {
+            throw TelegraphError.invalid("You do not have permission to post in this conversation")
+        }
+    }
+    func sendFile(_ attachment: OutgoingAttachment, caption: String, to peer: Int64, randomID: Int64,
+                  progress: @escaping AttachmentUploader.Progress) async throws {
+        try requireWritable(peer)
+        guard caption.utf16.count <= 1024 else { throw TelegraphError.invalid("Attachment captions are limited to 1,024 UTF-16 units") }
+        let target = try await authorizedMediaSession(dc: profile.mainDC)
+        let file = try await AttachmentUploader.upload(attachment, save: { [self] request in
+            let reply = try await self.rawRPC(request, on: target)
+            guard case .bool(let accepted) = reply else { throw TelegraphError.invalid("Unexpected file upload response") }
+            return accepted
+        }, progress: progress)
+        try Task.checkCancellation()
+        try requireWritable(peer)
+        let result = try await rpc("messages.sendMedia", [
+            "peer": .object(inputPeer(peer)), "media": .object(attachment.media(file: file)),
+            "message": .string(caption), "random_id": .long(randomID)
+        ])
+        await sent(result, text: caption, peer: peer)
+    }
+    private func sent(_ result: TLObject, text: String, peer: Int64) async {
         if result.name == "updateShortSentMessage" {
-            let msg = ChatMessage(id: result["id"].int, peerID: peer, date: result["date"].int, outgoing: true, text: text, media: nil, unsupported: nil)
-            apply(msg)
-            await advance(result)
+            var fields = result.fields
+            fields["out"] = .bool(true)
+            fields["peer_id"] = .object(MessagePeer.object(peer))
+            fields["message"] = .string(text)
+            if let message = ChatMessage.from(TLObject("message", fields)) { apply(message) }
+            if peer > 0 { await advance(result) }
         } else { await consume(result) }
         emit()
     }
@@ -336,6 +394,10 @@ actor TelegramClient {
         guard maxID > (readMax[peer] ?? 0) else { return }
         readMax[peer] = maxID
         do {
+            if peer < 0 {
+                _ = try await rawRPC(TLObject("channels.readHistory", ["channel": .object(inputChannel(-peer)), "max_id": .int(maxID)]))
+                dialogs[peer]?.unread = 0; emit(); return
+            }
             let result = try await rpc("messages.readHistory", ["peer": .object(inputPeer(peer)), "max_id": .int(maxID)])
             dialogs[peer]?.unread = 0
             await advance(result); emit()
@@ -345,7 +407,11 @@ actor TelegramClient {
         }
     }
     private func apply(_ message: ChatMessage) {
-        if dialogs[message.peerID] == nil { dialogs[message.peerID] = Conversation(id: message.peerID, title: title(message.peerID)) }
+        if dialogs[message.peerID] == nil {
+            if message.peerID < 0, chats[-message.peerID]?["broadcast"].bool != true { return }
+            dialogs[message.peerID] = Conversation(id: message.peerID, title: title(message.peerID),
+                canSend: message.peerID > 0 || chats[-message.peerID].map(canPost) == true)
+        }
         if message.date >= (dialogs[message.peerID]?.date ?? 0) {
             dialogs[message.peerID]?.date = message.date
             dialogs[message.peerID]?.preview = message.text.isEmpty ? (message.media?.label ?? message.unsupported ?? "") : message.text
@@ -394,7 +460,9 @@ actor TelegramClient {
     }
     private func applyUpdate(_ update: TLObject, difference: Bool = false) async {
         // Channel pts is a separate sequence and must never advance account pts.
-        if update.name.contains("Channel") || update.name.contains("channel") { return }
+        if update.name.contains("Channel") || update.name.contains("channel") {
+            await applyChannelUpdate(update, difference: difference); return
+        }
         if !difference, update.fields["pts"] != nil {
             let next = update["pts"].int, count = update["pts_count"].int
             if count > 0, next <= pts { return }
@@ -405,13 +473,13 @@ actor TelegramClient {
         switch update.name {
         case "updateNewMessage", "updateEditMessage":
             if let obj = update["message"].object, let message = ChatMessage.from(obj) {
-                let alreadyKnown = messages.contains { $0.id == message.id }
+                let alreadyKnown = messages.contains { $0.peerID == message.peerID && $0.id == message.id }
                 apply(message)
                 if update.name == "updateNewMessage", !message.outgoing, !alreadyKnown { dialogs[message.peerID]?.unread += 1 }
             }
         case "updateDeleteMessages":
             let ids = Set(update["messages"].array.map(\.int))
-            messages.removeAll { ids.contains($0.id) }
+            messages.removeAll { $0.peerID > 0 && ids.contains($0.id) }
         case "updateReadHistoryInbox":
             if let peer = update["peer"].object, peer.name == "peerUser" {
                 dialogs[peer["user_id"].long]?.unread = update["still_unread_count"].int
@@ -424,6 +492,77 @@ actor TelegramClient {
             }
         default: break
         }
+    }
+    private func applyChannelUpdate(_ update: TLObject, difference: Bool) async {
+        let object = update["message"].object
+        let id = object?["peer_id"].object?["channel_id"].long ?? update["channel_id"].long
+        guard id > 0, chats[id]?["broadcast"].bool == true else { return }
+        if !difference, syncingChannels.contains(id) {
+            if (bufferedChannels[id]?.count ?? 0) < 1024 { bufferedChannels[id, default: []].append(update) }
+            else { bufferedChannels[id] = [TLObject("updateChannelTooLong", ["channel_id": .long(id)])] }
+            return
+        }
+        if update.name == "updateChannelTooLong" {
+            if !difference { await recoverChannel(id) }; return
+        }
+        if !difference, update.fields["pts"] != nil {
+            let next = update["pts"].int, count = update["pts_count"].int, current = channelPTS[id] ?? 0
+            if count > 0, next <= current { return }
+            if current > 0, next > current, Int64(current) + Int64(count) != Int64(next) {
+                await recoverChannel(id)
+                // Apply this update if the difference did not yet include it.
+                if count > 0, next <= (channelPTS[id] ?? 0) { return }
+            }
+            // Retain the last contiguous state if recovery failed, so the next update can retry it.
+            if current == 0 || next <= (channelPTS[id] ?? 0) || Int64(channelPTS[id] ?? 0) + Int64(count) == Int64(next) {
+                channelPTS[id] = max(channelPTS[id] ?? 0, next)
+            }
+        }
+        switch update.name {
+        case "updateNewChannelMessage", "updateEditChannelMessage":
+            if let object, let message = ChatMessage.from(object) {
+                let known = messages.contains { $0.peerID == message.peerID && $0.id == message.id }
+                apply(message)
+                if update.name == "updateNewChannelMessage", !message.outgoing, !known { dialogs[-id]?.unread += 1 }
+            }
+        case "updateDeleteChannelMessages":
+            let ids = Set(update["messages"].array.map(\.int))
+            messages.removeAll { $0.peerID == -id && ids.contains($0.id) }
+        case "updateReadChannelInbox": dialogs[-id]?.unread = update["still_unread_count"].int
+        case "updateChannel":
+            if !difference { try? await loadDialogs() }
+        default: break
+        }
+    }
+    private func recoverChannel(_ id: Int64) async {
+        guard syncingChannels.insert(id).inserted else { return }
+        do {
+            for _ in 0..<100 {
+                let result = try await rpc("updates.getChannelDifference", [
+                    "channel": .object(inputChannel(id)), "filter": .object(TLObject("channelMessagesFilterEmpty")),
+                    "pts": .int(max(1, channelPTS[id] ?? 1)), "limit": .int(100)
+                ])
+                cache(result)
+                if result.name == "updates.channelDifferenceTooLong" {
+                    if let dialog = result["dialog"].object {
+                        channelPTS[id] = max(channelPTS[id] ?? 0, dialog["pts"].int)
+                        dialogs[-id]?.unread = dialog["unread_count"].int
+                    }
+                    if selectedID == -id { await select(-id) }
+                } else {
+                    for object in result["new_messages"].objects {
+                        if let message = ChatMessage.from(object), message.peerID == -id { apply(message) }
+                    }
+                    for update in result["other_updates"].objects { await applyUpdate(update, difference: true) }
+                    channelPTS[id] = max(channelPTS[id] ?? 0, result["pts"].int)
+                }
+                if result["final"].bool || result.name == "updates.channelDifferenceEmpty" { break }
+            }
+        } catch { sink.yield(.status(describe(error))) }
+        syncingChannels.remove(id)
+        let queue = bufferedChannels.removeValue(forKey: id) ?? []
+        for update in queue { await applyChannelUpdate(update, difference: false) }
+        emit()
     }
     private func recover() async {
         guard messaging, !syncing else { return }
@@ -456,6 +595,7 @@ actor TelegramClient {
             syncing = false
             let queue = buffered; buffered.removeAll()
             for update in queue { await consume(update) }
+            if let selectedID, selectedID < 0 { await recoverChannel(-selectedID) }
             sink.yield(.status("Connected")); emit()
         } catch {
             syncing = false
@@ -517,9 +657,11 @@ actor TelegramClient {
         throw TelegraphError.invalid("Too many file data-center redirects")
     }
     func refreshMedia(_ media: Media) async throws -> Media {
-        let reply = try await rpc("messages.getMessages", ["id": .vector([
+        var fields: [String: TLValue] = ["id": .vector([
             .object(TLObject("inputMessageID", ["id": .int(media.messageID)]))
-        ])])
+        ])]
+        if media.peerID < 0 { fields["channel"] = .object(inputChannel(-media.peerID)) }
+        let reply = try await rpc(media.peerID < 0 ? "channels.getMessages" : "messages.getMessages", fields)
         guard let refreshed = reply["messages"].objects.compactMap(ChatMessage.from).first(where: {
             $0.id == media.messageID && $0.peerID == media.peerID
         })?.media, refreshed.id == media.id else { throw TelegraphError.invalid("The attachment is no longer available") }
@@ -552,7 +694,7 @@ func describe(_ error: any Error) -> String {
             return "Telegram rate limit: try again in \(rpc.split(separator: "_").last ?? "?") seconds"
         }
         switch rpc {
-        case "CHAT_WRITE_FORBIDDEN", "USER_IS_BLOCKED", "YOU_BLOCKED_USER": return "Telegram does not allow sending to this conversation"
+        case "CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED", "CHANNEL_PRIVATE", "CHAT_SEND_MEDIA_FORBIDDEN", "CHAT_SEND_PHOTOS_FORBIDDEN", "CHAT_SEND_VIDEOS_FORBIDDEN", "CHAT_SEND_GIFS_FORBIDDEN", "USER_IS_BLOCKED", "YOU_BLOCKED_USER": return "Telegram does not allow sending to this conversation"
         case "ALLOW_PAYMENT_REQUIRED", "PAYMENT_REQUIRED": return "This chat requires payment; paid messages are not supported"
         case "PHONE_CODE_INVALID": return "Incorrect login code"
         case "PHONE_CODE_EXPIRED": return "Login code expired; request a new code"

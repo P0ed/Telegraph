@@ -1,8 +1,9 @@
 # Telegraph
 
 A minimal, full-screen Telegram client written in Swift for macOS 27.
-It supports a personal account's direct conversations and Saved Messages, phone-code
-login with 2FA, live text messaging, and paginated history. Click `[Image]`, `[Video]`,
+It supports a personal account's direct conversations, Saved Messages, and broadcast
+channels, phone-code login with 2FA, live messaging, file uploads, and paginated history.
+Click `[Image]`, `[Video]`,
 or `[GIF]` to download the attachment and open it with macOS Quick Look.
 
 The executable uses only Swift and macOS system libraries. There are no Swift package
@@ -42,6 +43,8 @@ legacy mouse reporting. Keyboard navigation works without mouse support.
 | Click an attachment label | Download/open that attachment |
 | PgUp / PgDn, mouse wheel | Scroll history; load earlier messages at the top |
 | Enter in composer | Send text |
+| Ctrl-F | Attach a file: paste or drag its path, then press Enter |
+| Ctrl-X in composer | Remove the staged attachment |
 | Ctrl-J | Insert a newline |
 | Paste | Insert text without sending it |
 | Left / Right, Ctrl-A / Ctrl-E | Move the composer cursor |
@@ -51,9 +54,23 @@ legacy mouse reporting. Keyboard navigation works without mouse support.
 | Ctrl-Z | Suspend; resume with your shell's `fg` |
 | Ctrl-C / Ctrl-D | Exit |
 
-A failed send retains the draft. Press Enter again to retry with the same Telegram
-message identifier. Editing the draft creates a new identifier. Active chats are
+A failed send retains the draft and attachment. Press Enter again to retry with the
+same Telegram message identifier. Editing the draft or replacing/removing its
+attachment creates a new identifier. Active chats are
 marked read when their latest messages are visible.
+
+To post a meme, open your channel (marked `#` in the chat list), press **Ctrl-F**,
+paste or drag in an image, GIF, video, or other file, and press **Enter** to attach it.
+Type an optional caption and press **Enter** again to send. **Escape** cancels file
+path entry; **Ctrl-X** removes an attachment without clearing its caption. Quoted
+paths, escaped spaces, `~/` paths, and local `file://` URLs are accepted.
+
+JPEG and PNG images are sent as photos; GIFs retain their animation, and supported
+videos include their dimensions and duration. Other files, including videos macOS
+cannot inspect, are sent as documents. Uploads
+stream in 512 KB chunks with progress, with a maximum of 4,000 parts (about 2 GB).
+Captions are limited to 1,024 UTF-16 units. Files must remain unchanged until sent;
+reattach a file if you edit it. Channels where you lack posting rights are read-only.
 
 Downloads are saved to `~/Downloads/Telegraph/<account-id>/`. Downloads run one at a
 time, stream to temporary files, and become reusable files only after completion.
@@ -93,9 +110,10 @@ The optional live test creates an MTProto transport key on Telegram's test serve
 and verifies an encrypted RPC response using an invalid application ID. It neither
 logs in nor accesses an account. The normal suite uses independent arithmetic and
 server-side SRP fixtures, scripted encrypted transports, temporary files, and
-pseudo-terminals. It covers login migration, invalid codes, direct-chat filtering,
+pseudo-terminals. It covers login migration, invalid codes, conversation filtering,
 history, sending/retrying multiline text through the terminal, mouse/paste decoding,
-terminal restoration, integrity rejection, timeouts, and download recovery.
+terminal restoration, integrity rejection, timeouts, download recovery, channel
+message boxes and update recovery, chunked uploads, media metadata, and attachment retries.
 
 For a manual account test, run `telegraph --test-server` with your own application
 credentials and an existing Telegram test account. It uses a separate Keychain
@@ -103,9 +121,10 @@ entry, process lock, and `Downloads/Telegraph/test/` directory. Production accou
 login and actual media viewing require locally entered credentials and interactive
 verification.
 
-The first version excludes groups, channels, secret chats, calls, attachment uploads,
+This version excludes groups, secret chats, calls, albums,
 global user search, and creating new conversations. It has no persistent message
-database. Only the existing direct conversations returned by Telegram are listed.
+database. Only existing direct conversations and broadcast channels returned by
+Telegram are listed.
 
 The implementation separates MTProto transport/cryptography/TL decoding, account
 and messaging state, media storage, and terminal rendering. Networking and client

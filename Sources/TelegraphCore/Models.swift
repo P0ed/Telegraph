@@ -7,6 +7,22 @@ struct Conversation: Sendable, Equatable, Identifiable {
     var date: Int32 = 0
     var preview = ""
     var pinned = false
+    var canSend = true
+    var isChannel: Bool { id < 0 }
+}
+
+// User IDs are positive; channel IDs are negated so their message boxes cannot collide.
+enum MessagePeer {
+    static func id(_ peer: TLObject) -> Int64? {
+        switch peer.name {
+        case "peerUser": return peer["user_id"].long > 0 ? peer["user_id"].long : nil
+        case "peerChannel": return peer["channel_id"].long > 0 ? -peer["channel_id"].long : nil
+        default: return nil
+        }
+    }
+    static func object(_ id: Int64) -> TLObject {
+        id < 0 ? TLObject("peerChannel", ["channel_id": .long(-id)]) : TLObject("peerUser", ["user_id": .long(id)])
+    }
 }
 
 enum MediaKind: String, Sendable { case image = "Image", video = "Video", gif = "GIF" }
@@ -35,8 +51,8 @@ struct ChatMessage: Sendable, Equatable, Identifiable {
 
     static func from(_ object: TLObject) -> Self? {
         guard object.name == "message" || object.name == "messageService",
-              let peer = object["peer_id"].object, peer.name == "peerUser" else { return nil }
-        let peerID = peer["user_id"].long, messageID = object["id"].int
+              let peer = object["peer_id"].object, let peerID = MessagePeer.id(peer) else { return nil }
+        let messageID = object["id"].int
         let rawMedia = object["media"].object
         let media = rawMedia.flatMap { parseMedia($0, peer: peerID, message: messageID, restricted: object["noforwards"].bool) }
         let unsupported: String?

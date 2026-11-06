@@ -3,7 +3,7 @@ import Darwin
 
 enum InputEvent: Equatable, Sendable {
     case text(String), paste(String), up, down, left, right, home, end, pageUp, pageDown
-    case enter, backspace, delete, tab, backtab, escape, quit, redraw, suspend, clear, deleteWord
+    case enter, backspace, delete, tab, backtab, escape, quit, redraw, suspend, clear, deleteWord, attach, detach
     case mouse(x: Int, y: Int, button: Int, release: Bool)
 }
 
@@ -71,9 +71,9 @@ struct InputDecoder {
             }
             if b < 32 || b == 127 {
                 buffer.removeFirst()
-                let mapping: [UInt8: InputEvent] = [1: .home, 3: .quit, 4: .quit, 5: .end, 8: .backspace,
+                let mapping: [UInt8: InputEvent] = [1: .home, 3: .quit, 4: .quit, 5: .end, 6: .attach, 8: .backspace,
                     9: .tab, 10: .text("\n"), 12: .redraw, 13: .enter, 21: .clear, 23: .deleteWord,
-                    26: .suspend, 127: .backspace]
+                    24: .detach, 26: .suspend, 127: .backspace]
                 if let event = mapping[b] { events.append(event) }
                 continue
             }

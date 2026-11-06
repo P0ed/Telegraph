@@ -15,7 +15,7 @@ public enum TelegraphApp {
     private static func execute(_ arguments: [String]) async throws -> Int32 {
         if arguments == ["--help"] || arguments == ["-h"] {
             print("""
-            Telegraph 0.1.0 — Telegram direct messages in your terminal
+            Telegraph 0.1.0 — Telegram chats and channels in your terminal
 
             Usage: telegraph [--test-server]
                    telegraph logout [--test-server]
@@ -27,6 +27,8 @@ public enum TelegraphApp {
 
             Tab cycles chats, history, and composer. Arrows select; Enter opens
             a chat/media or sends text. PgUp/PgDn scroll; Ctrl-J inserts a newline.
+            Ctrl-F attaches a file: paste or drag its path, then Enter to attach.
+            Type an optional caption; Enter sends. Ctrl-X removes the attachment.
             Click [Image], [Video], or [GIF] to download and open with Quick Look.
             Ctrl-C or Ctrl-D exits. Escape returns to the chat list.
 

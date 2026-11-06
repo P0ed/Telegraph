@@ -17,7 +17,7 @@ struct HistoryLayout {
         for message in messages {
             let date = Date(timeIntervalSince1970: TimeInterval(message.date))
             let time = date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
-            result.append(HistoryLine(text: "\(time)  \(message.outgoing ? "You" : "Them")"))
+            result.append(HistoryLine(text: "\(time)  \(message.outgoing ? "You" : (message.peerID < 0 ? "Channel" : "Them"))"))
             if !message.text.isEmpty {
                 result += TerminalText.wrap(message.text, width: max(1, width - 2)).map { HistoryLine(text: "  " + $0) }
             }
@@ -38,6 +38,7 @@ final class TerminalUI {
         var characters: [Character] = []
         var cursor = 0
         var randomID: Int64?
+        var attachment: OutgoingAttachment?
         var text: String { String(characters) }
     }
     private let terminal: TerminalIO
@@ -52,6 +53,8 @@ final class TerminalUI {
     private var mediaSelection: String?
     private var hits: [MediaHit] = []
     private var drafts: [Int64: Draft] = [:]
+    private var pathDraft: Draft?
+    private var preparingAttachment: Set<Int64> = []
     private var sending: Set<Int64> = []
     private var downloading: Set<String> = []
     private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -128,6 +131,7 @@ final class TerminalUI {
         let old = snapshot
         if old.selectedID != next.selectedID {
             scrollOffset = 0; mediaSelection = nil; olderRequested = false
+            pathDraft = nil
         } else if scrollOffset > 0, let previous = old.messages.last?.id,
                   let last = next.messages.last?.id, last > previous {
             let oldCount = HistoryLayout.lines(old.messages, width: historyWidth).count
@@ -159,13 +163,14 @@ final class TerminalUI {
         render()
     }
     private func edit(_ action: (inout Draft) -> Void) {
-        guard let peer = snapshot.selectedID, !sending.contains(peer) else { return }
-        var draft = drafts[peer] ?? Draft()
+        guard let peer = snapshot.selectedID, !sending.contains(peer), !preparingAttachment.contains(peer),
+              snapshot.conversations.first(where: { $0.id == peer })?.canSend == true else { return }
+        var draft = pathDraft ?? drafts[peer] ?? Draft()
         let before = draft.text
         action(&draft)
         draft.cursor = min(max(0, draft.cursor), draft.characters.count)
         if draft.text != before { draft.randomID = nil }
-        drafts[peer] = draft
+        if pathDraft != nil { pathDraft = draft } else { drafts[peer] = draft }
     }
     private func handle(_ input: InputEvent) {
         guard !stopped else { return }
@@ -173,8 +178,16 @@ final class TerminalUI {
         case .quit: stop(0)
         case .suspend: terminal.suspend()
         case .redraw: break
-        case .escape: focus = .chats
+        case .escape:
+            if pathDraft != nil { pathDraft = nil; status = "Attachment cancelled" }
+            else { focus = .chats }
+        case .attach: beginAttachment()
+        case .detach:
+            if focus == .composer, pathDraft == nil {
+                edit { if $0.attachment != nil { $0.attachment = nil; $0.randomID = nil } }
+            }
         case .tab, .backtab:
+            guard pathDraft == nil else { return }
             let step = input == .tab ? 1 : 2
             focus = Focus(rawValue: (focus.rawValue + step) % 3)!
             if focus == .history, mediaSelection == nil { moveMedia(-1) }
@@ -189,13 +202,14 @@ final class TerminalUI {
             case .chats: openChat()
             case .history:
                 if let line = layout.first(where: { $0.mediaKey == mediaSelection }), let media = line.media { openMedia(media) }
-            case .composer: send()
+            case .composer:
+                if pathDraft != nil { attachPath() } else { send() }
             }
         case .text(let text), .paste(let text):
             guard focus == .composer else { return }
             let cleaned = Array(TerminalText.clean(text))
             edit { draft in
-                let room = max(0, 4096 - draft.text.utf16.count)
+                let room = max(0, (self.pathDraft == nil ? 4096 : 8192) - draft.text.utf16.count)
                 var insert: [Character] = [], used = 0
                 for c in cleaned {
                     let size = String(c).utf16.count
@@ -249,6 +263,7 @@ final class TerminalUI {
     }
     private func openChat() {
         guard let id = chatCursor else { return }
+        pathDraft = nil
         focus = .composer; scrollOffset = 0
         launch { await self.client.select(id) }
     }
@@ -273,17 +288,27 @@ final class TerminalUI {
         if index >= end { scrollOffset = max(0, lines.count - index - 1) }
     }
     private func send() {
-        guard let peer = snapshot.selectedID, !sending.contains(peer), var draft = drafts[peer],
-              !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard let peer = snapshot.selectedID, !sending.contains(peer), !preparingAttachment.contains(peer), var draft = drafts[peer],
+              draft.attachment != nil || !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard snapshot.conversations.first(where: { $0.id == peer })?.canSend == true else {
+            status = "You do not have permission to post in this conversation"; return
+        }
+        if draft.attachment != nil, draft.text.utf16.count > 1024 {
+            status = "Attachment captions are limited to 1,024 UTF-16 units"; return
+        }
         do { if draft.randomID == nil { draft.randomID = try Crypto.randomID() } }
         catch { status = describe(error); return }
         drafts[peer] = draft; sending.insert(peer)
-        let text = draft.text, token = draft.randomID!
+        let text = draft.text, token = draft.randomID!, attachment = draft.attachment
         status = "Sending…"
-        launch {
+        launch { [self] in
             defer { self.sending.remove(peer); self.render() }
             do {
-                try await self.client.sendText(text, to: peer, randomID: token)
+                if let attachment {
+                    try await self.client.sendFile(attachment, caption: text, to: peer, randomID: token) { [weak self] uploaded, total in
+                        await self?.uploadProgress(peer: peer, name: attachment.name, uploaded: uploaded, total: total)
+                    }
+                } else { try await self.client.sendText(text, to: peer, randomID: token) }
                 self.drafts[peer] = Draft()
                 if self.snapshot.selectedID == peer { self.scrollOffset = 0 }
                 self.status = "Sent"
@@ -291,6 +316,39 @@ final class TerminalUI {
                 self.status = "\(describe(error)) — Enter retries the same message"
             }
         }
+    }
+    private func beginAttachment() {
+        guard let peer = snapshot.selectedID, !sending.contains(peer), !preparingAttachment.contains(peer) else { return }
+        guard snapshot.conversations.first(where: { $0.id == peer })?.canSend == true else {
+            status = "You do not have permission to post in this conversation"; return
+        }
+        focus = .composer; pathDraft = Draft()
+        status = "Paste or drag one file path; Enter attaches, Esc cancels"
+    }
+    private func attachPath() {
+        guard let peer = snapshot.selectedID, let pathDraft else { return }
+        let url: URL
+        do { url = try AttachmentPath.url(pathDraft.text) }
+        catch { status = describe(error); return }
+        self.pathDraft = nil
+        preparingAttachment.insert(peer)
+        status = "Preparing \(url.lastPathComponent)…"
+        launch {
+            defer { self.preparingAttachment.remove(peer); self.render() }
+            do {
+                let attachment = try await OutgoingAttachment.prepare(url)
+                try Task.checkCancellation()
+                var draft = self.drafts[peer] ?? Draft()
+                draft.attachment = attachment; draft.randomID = nil
+                self.drafts[peer] = draft
+                self.status = "Attached \(attachment.name) — add a caption, Enter sends; Ctrl-X removes"
+            } catch { self.status = describe(error) }
+        }
+    }
+    private func uploadProgress(peer: Int64, name: String, uploaded: Int64, total: Int64) {
+        guard !stopped, snapshot.selectedID == peer else { return }
+        status = "Uploading \(uploaded * 100 / max(1, total))% — \(name)"
+        render()
     }
     private func openMedia(_ media: Media) {
         guard !media.restricted else { status = "Telegram restricts saving this attachment"; return }
@@ -327,7 +385,8 @@ final class TerminalUI {
         let leftWidth = sidebar, rightWidth = width - leftWidth - 1
         var left = [String](repeating: "", count: height), right = left
         left[0] = " TELEGRAPH"
-        let title = snapshot.conversations.first { $0.id == snapshot.selectedID }?.title ?? "Select a conversation"
+        let conversation = snapshot.conversations.first { $0.id == snapshot.selectedID }
+        let title = conversation?.title ?? "Select a conversation"
         right[0] = " \(title)"
         chatOffset = min(chatOffset, max(0, snapshot.conversations.count - visibleRows))
         for row in 0..<visibleRows {
@@ -336,7 +395,7 @@ final class TerminalUI {
                 let dialog = snapshot.conversations[index]
                 let cursor = dialog.id == chatCursor ? "›" : " "
                 let unread = dialog.unread > 0 ? " (\(dialog.unread))" : ""
-                left[row + 1] = "\(cursor) \(dialog.title)\(unread)"
+                left[row + 1] = "\(cursor) \(dialog.isChannel ? "# " : "")\(dialog.title)\(unread)"
             }
         }
         let lines = layout
@@ -354,7 +413,11 @@ final class TerminalUI {
         left[height - 4] = focus == .chats ? " Chats •" : " Chats"
         right[height - 4] = focus == .history ? " History •  Enter opens media" : " History"
         if snapshot.loading { right[height - 4] += " — loading…" }
-        let draft = snapshot.selectedID.flatMap { drafts[$0] } ?? Draft()
+        let messageDraft = snapshot.selectedID.flatMap { drafts[$0] } ?? Draft()
+        if let attachment = messageDraft.attachment {
+            right[height - 4] = " Attached: \(attachment.name) · Ctrl-X removes"
+        }
+        let draft = pathDraft ?? messageDraft
         let flat: (Character) -> String = { $0 == "\n" ? "↵" : String($0) }
         let before = draft.characters.prefix(draft.cursor).map(flat).joined()
         let after = draft.characters.dropFirst(draft.cursor).map(flat).joined()
@@ -365,15 +428,17 @@ final class TerminalUI {
             if used + size >= editWidth { break }
             visibleBefore.insert(character, at: visibleBefore.startIndex); used += size
         }
-        right[height - 3] = "> " + visibleBefore + after
+        right[height - 3] = (pathDraft == nil ? "> " : "+ ") + visibleBefore + after
+        if conversation?.canSend == false { right[height - 3] = " Read-only channel — posting requires admin rights" }
         left[height - 3] = focus == .composer ? " Compose •" : " Compose"
+        if pathDraft != nil { left[height - 3] = " File path •" }
         var rows: [String] = []
         for row in 0..<height {
             if row == height - 2 {
                 rows.append("\u{1b}[0m" + TerminalText.fit(" " + status, width: width)); continue
             }
             if row == height - 1 {
-                rows.append("\u{1b}[2m" + TerminalText.fit(" Tab focus · ↑↓ select · Enter open/send · PgUp/PgDn scroll · Ctrl-J newline · Ctrl-C quit", width: width) + "\u{1b}[0m")
+                rows.append("\u{1b}[2m" + TerminalText.fit(" Ctrl-F attach · Enter send/open · Tab focus · ↑↓ select · PgUp/PgDn scroll · Ctrl-C quit", width: width) + "\u{1b}[0m")
                 continue
             }
             let leftHighlighted = row == 0 || (focus == .chats && row > 0 && row <= visibleRows &&
@@ -387,7 +452,7 @@ final class TerminalUI {
                         rightStyle + TerminalText.fit(right[row], width: rightWidth) + "\u{1b}[0m")
         }
         var frame = "\u{1b}[?25l\u{1b}[H" + rows.joined(separator: "\r\n")
-        if focus == .composer, snapshot.selectedID != nil {
+        if focus == .composer, snapshot.selectedID != nil, conversation?.canSend == true {
             let x = leftWidth + 4 + TerminalText.width(visibleBefore)
             frame += "\u{1b}[\(height - 2);\(min(width, x))H\u{1b}[?25h"
         }
